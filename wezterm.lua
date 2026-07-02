@@ -17,6 +17,99 @@ end
 -- ここまでは定型文
 -- この先でconfigに各種設定を書いていく
 
+-- 同じ向きに並んだペインを均等サイズ（1:1:1...）に整える
+-- ※ 一方向に並んだレイアウト（全部縦積み or 全部横並び）向け
+-- AdjustPaneSize はアクティブペインにしか効かず、移動量も実挙動とズレやすいので、
+-- 「毎回サイズを読み直して 1 境界ずつ補正」を複数パス繰り返して収束させる。
+local function balance_panes(window)
+    local tab0 = window:active_tab()
+    if not tab0 then return end
+    local infos0 = tab0:panes_with_info()
+    if #infos0 < 2 then return end
+
+    -- 元のアクティブペイン（最後にフォーカスを戻す）
+    local active_pane
+    for _, p in ipairs(infos0) do
+        if p.is_active then active_pane = p.pane end
+    end
+
+    local function count(t)
+        local c = 0
+        for _ in pairs(t) do c = c + 1 end
+        return c
+    end
+
+    -- 並びの向きを判定：top のばらつき＞left のばらつきなら縦積み（高さを均等化）
+    local function is_vertical(infos)
+        local tops, lefts = {}, {}
+        for _, p in ipairs(infos) do
+            tops[p.top] = true
+            lefts[p.left] = true
+        end
+        return count(tops) >= count(lefts)
+    end
+
+    local passes = 4 -- 収束のための繰り返し回数
+
+    -- 1 ティックにつき 1 境界だけ補正する（その都度サイズを読み直す）
+    local function tick(remaining, border)
+        local tab = window:active_tab()
+        if not tab then return end
+        local infos = tab:panes_with_info()
+        local n = #infos
+        if n < 2 then return end
+
+        local vertical = is_vertical(infos)
+        table.sort(infos, function(a, b)
+            if vertical then return a.top < b.top else return a.left < b.left end
+        end)
+
+        local total = 0
+        for _, p in ipairs(infos) do
+            total = total + (vertical and p.height or p.width)
+        end
+        local target = total / n
+
+        -- border 番号（1..n-1）の現在位置と目標位置の差を求める
+        local cum = 0
+        for i = 1, border do
+            cum = cum + (vertical and infos[i].height or infos[i].width)
+        end
+        local desired = math.floor(border * target + 0.5)
+        local delta = desired - cum
+        if delta ~= 0 then
+            if delta > 0 then
+                -- 境界を後ろへ：手前(border)のペインを広げる
+                infos[border].pane:activate()
+                window:perform_action(
+                    wezterm.action.AdjustPaneSize { (vertical and 'Down' or 'Right'), delta },
+                    infos[border].pane)
+            else
+                -- 境界を前へ：次(border+1)のペインを広げる
+                infos[border + 1].pane:activate()
+                window:perform_action(
+                    wezterm.action.AdjustPaneSize { (vertical and 'Up' or 'Left'), -delta },
+                    infos[border + 1].pane)
+            end
+        end
+
+        -- 次の境界へ。最後まで行ったら次のパスへ
+        local next_border = border + 1
+        local next_remaining = remaining
+        if next_border > n - 1 then
+            next_border = 1
+            next_remaining = remaining - 1
+        end
+        if next_remaining > 0 then
+            wezterm.time.call_after(0.03, function() tick(next_remaining, next_border) end)
+        elseif active_pane then
+            active_pane:activate() -- フォーカスを元に戻す
+        end
+    end
+
+    tick(passes, 1)
+end
+
 -- 起動時のデフォルトシェルをPowerShellにする（デフォルトはコマンドプロンプト）
 config.default_prog = { 'pwsh.exe', '-NoLogo' }
 
@@ -74,8 +167,47 @@ config.inactive_pane_hsb = {
 -- スクロールバック行数を増やす（デフォルト3500行）
 config.scrollback_lines = 10000
 
+-- Neovim(smart-splits.nvim) 連携用ヘルパ
+-- アクティブペインで nvim が動いているかを判定する
+local function is_nvim(pane)
+    -- 1) 最も確実: nvim が起動時に立てる user var(IS_NVIM) を見る。
+    --    Windows でプロセス名判定が外れても、これがあれば確実に nvim へ転送できる。
+    local vars = pane:get_user_vars()
+    if vars and vars.IS_NVIM == 'true' then
+        return true
+    end
+    -- 2) フォールバック: 前面プロセス名(nvim.exe 等)で判定
+    local info = pane:get_foreground_process_info()
+    local name = info and info.name or ''
+    -- フルパス/拡張子付き(nvim.exe 等)でも拾えるよう小文字化して部分一致
+    return name:lower():find('n?vim') ~= nil
+end
+
+-- Ctrl+HJKL: nvim なら同じキーを nvim に送り(=分割移動)、
+-- そうでなければ Wezterm のペイン移動を行う。nvim 側が端に達したときは
+-- smart-splits.nvim が Wezterm 側のペイン移動へ引き継ぐ。
+local nav_directions = { h = 'Left', j = 'Down', k = 'Up', l = 'Right' }
+local function split_nav(key)
+    return {
+        key = key,
+        mods = 'CTRL',
+        action = wezterm.action_callback(function(win, pane)
+            if is_nvim(pane) then
+                win:perform_action(wezterm.action.SendKey { key = key, mods = 'CTRL' }, pane)
+            else
+                win:perform_action(wezterm.action.ActivatePaneDirection(nav_directions[key]), pane)
+            end
+        end),
+    }
+end
+
 -- キーバインド
 config.keys = {
+    -- Ctrl HJKL で nvim分割 ↔ Weztermペイン をシームレス移動（nvim連携）
+    split_nav('h'),
+    split_nav('j'),
+    split_nav('k'),
+    split_nav('l'),
     -- Ctrl Shift + でフォントサイズを大きくする
     {
         key = "+",
@@ -105,6 +237,14 @@ config.keys = {
         key = "e",
         mods = "CTRL|SHIFT",
         action = wezterm.action.SplitVertical { domain = "CurrentPaneDomain" },
+    },
+    -- Ctrl Shift b でペインを均等サイズ（1:1:1...）に整える
+    {
+        key = "b",
+        mods = "CTRL|SHIFT",
+        action = wezterm.action_callback(function(window, pane)
+            balance_panes(window)
+        end),
     },
     -- Ctrl Shift o でペインの中身を入れ替える
     {
